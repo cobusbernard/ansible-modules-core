@@ -83,6 +83,11 @@ options:
     choices: ['always', 'on_create']
     description:
      - C(always) will update passwords if they differ.  C(on_create) will only set the password for newly created users.
+  assume_role_policy:
+    description:
+      - The trust relationship policy document that grants an entity permission to assume the role. (can only be used with "role" type C(iam_type))
+    required: false
+    default: null
   aws_secret_key:
     description:
       - AWS secret key. If not set then the value of the AWS_SECRET_KEY environment variable is used.
@@ -100,6 +105,7 @@ notes:
 author:
     - "Jonathan I. Davila (@defionscode)"
     - "Paul Seiffert (@seiffert)"
+    - "Cobus Bernard (@cobusbernard)"
 extends_documentation_fragment:
     - aws
     - ec2
@@ -140,6 +146,14 @@ task:
     groups: "{{ item.created_group.group_name }}"
   with_items: new_groups.results
 
+# Create cross account role
+tasks:
+- name: Create a new cross account role.
+  iam:
+    iam_type: role
+    name: CrossAccountRole
+    state: present
+    assume_role_policy: "lookup('file', 'template/my_assume_role.json.j2')"
 '''
 
 import json
@@ -152,6 +166,13 @@ try:
     HAS_BOTO = True
 except ImportError:
    HAS_BOTO = False
+
+try:
+    import boto3
+    import botocore.exceptions
+    HAS_BOTO3 = True
+except ImportError:
+   HAS_BOTO3 = False
 
 def boto_exception(err):
     '''generic error message handler'''
@@ -443,7 +464,7 @@ def update_group(module=None, iam=None, name=None, new_name=None, new_path=None)
     return changed, name, new_path, current_group_path
 
 
-def create_role(module, iam, name, path, role_list, prof_list):
+def create_role(module, iam, name, path, role_list, prof_list, assume_role_policy_json):
     changed = False
     try:
         if name not in role_list:
@@ -454,13 +475,23 @@ def create_role(module, iam, name, path, role_list, prof_list):
             if name not in prof_list:
                 iam.create_instance_profile(name, path=path)
                 iam.add_role_to_instance_profile(name, name)
+        if assume_role_policy_json:
+            boto3_region, boto3_ec2_url, boto3_aws_connect_kwargs = get_aws_connection_info(module, boto3=True)
+            boto3_iam = boto3_conn(module, conn_type='client', resource='iam', region=boto3_region, endpoint=boto3_ec2_url, **boto3_aws_connect_kwargs)
+
+            boto3_role = boto3_iam.get_role(RoleName=name)['Role']
+
+            if boto3_role:
+                if boto3_role['AssumeRolePolicyDocument'] != assume_role_policy_json:
+                    changed = True
+                    boto3_iam.update_assume_role_policy(RoleName=name, PolicyDocument=json.dumps(assume_role_policy_json))
+
     except boto.exception.BotoServerError, err:
         module.fail_json(changed=changed, msg=str(err))
     else:
         updated_role_list = [rl['role_name'] for rl in iam.list_roles().list_roles_response.
                              list_roles_result.roles]
     return changed, updated_role_list
-
 
 def delete_role(module, iam, name, role_list, prof_list):
     changed = False
@@ -525,7 +556,8 @@ def main():
         name=dict(default=None, required=False),
         new_name=dict(default=None, required=False),
         path=dict(default='/', required=False),
-        new_path=dict(default=None, required=False)
+        new_path=dict(default=None, required=False),
+        assume_role_policy_json=dict(default=None, required=False)
     )
     )
 
@@ -554,6 +586,16 @@ def main():
             module.fail_json(changed=False, msg="At least one access key has to be defined in order"
                                                 " to use 'active' or 'inactive'")
     key_ids = module.params.get('access_key_ids')
+
+    assume_role_policy_json = module.params.get('assume_role_policy_json')
+    if assume_role_policy_json:
+        if iam_type != 'role':
+            module.fail_json(changed=False, msg="Assume role policy may only be applied to roles.")
+        if not HAS_BOTO3:
+            module.fail_json(changed=False, msg="Assume role policy requires Boto3.")
+#        with open(module.params.get('assume_role_policy_json'), 'r') as json_data:
+#                  assume_role_pdoc = json.dumps(json.load(json_data))
+#                  json_data.close()
 
     if iam_type == 'user' and module.params.get('password') is not None:
         pwd = module.params.get('password')
@@ -721,7 +763,7 @@ def main():
         role_list = []
         if state == 'present':
             changed, role_list = create_role(
-                module, iam, name, path, orig_role_list, orig_prof_list)
+                module, iam, name, path, orig_role_list, orig_prof_list, assume_role_policy_json)
         elif state == 'absent':
             changed, role_list = delete_role(
                 module, iam, name, orig_role_list, orig_prof_list)
